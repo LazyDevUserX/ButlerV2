@@ -15,8 +15,8 @@ DESTINATION_CHAT_ID = int(os.environ.get("DESTINATION_CHAT_ID", 0))
 forward_with_header = True
 
 # --- Userbot (Backend) Client ---
-# The session string will be generated the first time it runs and stored
-app_user = Client(USERBOT_SESSION, api_id=API_ID, api_hash=API_HASH)
+# The session_string parameter is what makes this non-interactive.
+app_user = Client("my_session", api_id=API_ID, api_hash=API_HASH, session_string=USERBOT_SESSION)
 
 @app_user.on_message(filters.chat(SOURCE_CHAT_ID) & filters.poll)
 async def handle_poll(client, message):
@@ -75,4 +75,4 @@ async def main():
     )
 
 if __name__ == "__main__":
-    app_user.run() # This will run the userbot and keep it alive, implicitly handling the async loop.
+    asyncio.run(main())
