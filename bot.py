@@ -1,78 +1,97 @@
-import os
 import asyncio
-from pyrogram import Client, filters
-from pyrogram.enums import PollType
+import os
+import json
+import logging
+from telethon import TelegramClient, events, types
+from telethon.errors import BadRequestError
+from telethon.sessions import StringSession
 
-# --- Environment Variables ---
-API_ID = os.environ.get("API_ID")
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-USERBOT_SESSION = os.environ.get("USERBOT_SESSION")
-SOURCE_CHAT_ID = int(os.environ.get("SOURCE_CHAT_ID", 0))
-DESTINATION_CHAT_ID = int(os.environ.get("DESTINATION_CHAT_ID", 0))
+# ---------------------------
+# Logging setup
+# ---------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Settings for the userbot, controlled by the frontend bot
-forward_with_header = True
+# ---------------------------
+# Load settings
+# ---------------------------
+SETTINGS_FILE = "settings.json"
+if os.path.exists(SETTINGS_FILE):
+    with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+        settings = json.load(f)
+else:
+    settings = {"replace": True, "src": "source_chat", "dst": "target_chat"}
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
 
-# --- Userbot (Backend) Client ---
-# The session_string parameter is what makes this non-interactive.
-app_user = Client("my_session", api_id=API_ID, api_hash=API_HASH, session_string=USERBOT_SESSION)
+# ---------------------------
+# Telegram API setup
+# ---------------------------
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+SESSION_STRING = os.getenv("SESSION_STRING")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID"))
 
-@app_user.on_message(filters.chat(SOURCE_CHAT_ID) & filters.poll)
-async def handle_poll(client, message):
-    if forward_with_header:
-        # Option 1: Forward with header (normal forward)
-        await client.forward_messages(DESTINATION_CHAT_ID, from_chat_id=message.chat.id, message_ids=message.id)
-    else:
-        # Option 2: Recreate poll without header
-        poll_data = message.poll
+# Initialize both clients
+user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+bot_client = TelegramClient('bot', API_ID, API_HASH)
+
+# ---------------------------
+# Poll copy helper
+# ---------------------------
+async def copy_poll(message, dst_chat):
+    """Safely rebuild and send a poll from a message object."""
+    try:
+        orig = message.poll.poll
+
+        new_poll = types.Poll(
+            id=0,
+            question=types.TextWithEntities(text=orig.question.text, entities=orig.question.entities or []),
+            answers=[
+                types.PollAnswer(
+                    text=types.TextWithEntities(text=ans.text.text, entities=ans.text.entities or []),
+                    option=ans.option
+                )
+                for ans in orig.answers
+            ],
+            multiple_choice=orig.multiple_choice,
+            quiz=orig.quiz
+        )
+
+        solution = None
+        solution_entities = None
+        correct_answers = None
         
-        # Check if it's a quiz poll to get the correct answer and explanation
-        if poll_data.is_quiz:
-            correct_id = poll_data.correct_option_id
-            explanation = poll_data.explanation
-            await client.send_poll(
-                chat_id=DESTINATION_CHAT_ID,
-                question=poll_data.question,
-                options=[o.text for o in poll_data.options],
-                is_anonymous=poll_data.is_anonymous,
-                allows_multiple_answers=poll_data.allows_multiple_answers,
-                is_quiz=True,
-                correct_option_id=correct_id,
-                explanation=explanation
-            )
-        else:
-            await client.send_poll(
-                chat_id=DESTINATION_CHAT_ID,
-                question=poll_data.question,
-                options=[o.text for o in poll_data.options],
-                is_anonymous=poll_data.is_anonymous,
-                allows_multiple_answers=poll_data.allows_multiple_answers,
-                is_quiz=False
-            )
+        # --- FIX: Correctly calculate the correct_answers from the results list ---
+        if message.media.results:
+            solution = message.media.results.solution
+            solution_entities = message.media.results.solution_entities
+            # Iterate through the results to find the correct one(s)
+            if message.media.results.results:
+                correct_answers = [res.option for res in message.media.results.results if res.correct]
 
-# --- Bot (Frontend) Client ---
-app_bot = Client(":memory:", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
+        media = types.InputMediaPoll(
+            poll=new_poll,
+            correct_answers=correct_answers,
+            solution=solution,
+            solution_entities=solution_entities
+        )
 
-@app_bot.on_message(filters.command("start"))
-async def start_command(client, message):
-    await message.reply_text("Hello! I am your poll forwarder command center. Use /toggle_header to change settings.")
+        await user_client.send_file(dst_chat, file=media)
+        logger.info(f"✅ Poll from message {message.id} copied successfully")
+        return True
+    except Exception as e:
+        logger.exception(f"⚠️ Poll copy for message {message.id} failed: {e}")
+        return False
 
-@app_bot.on_message(filters.command("toggle_header"))
-async def toggle_header_command(client, message):
-    global forward_with_header
-    forward_with_header = not forward_with_header
-    if forward_with_header:
-        await message.reply_text("Forwarding mode changed: **With Header** (Normal Forward).")
-    else:
-        await message.reply_text("Forwarding mode changed: **Without Header** (Recreate Poll).")
+# ---------------------------
+# /forward COMMAND
+# ---------------------------
+@bot_client.on(events.NewMessage(pattern=r'/forward (\d+) (\d+)', from_users=OWNER_ID))
+async def forward_range_handler(event):
+    start_id = int(event.pattern_match.group(1))
+    end_id = int(event.pattern_match.group(2))
 
-# --- Main function to run both clients ---
-async def main():
-    await asyncio.gather(
-        app_user.start(),
-        app_bot.start()
-    )
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    if start_id > end_id:
+        await event.respond("❌ **Error:** Start ID must be less than or equal to End ID.")
